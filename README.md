@@ -1,4 +1,4 @@
-# CodeBuddy Backend
+# CodeTech Backend
 
 This is the backend service for CodeBuddy, a real-time collaborative coding platform. It is built using Django, Django Channels for WebSocket support, and Redis as the message broker. The backend is containerized using Docker and orchestrated with Docker Compose.
 
