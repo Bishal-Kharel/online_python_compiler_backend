@@ -31,6 +31,8 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
+CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS').split(',')
+
 ROOT_URLCONF = 'codebuddy.urls'
 
 TEMPLATES = [
