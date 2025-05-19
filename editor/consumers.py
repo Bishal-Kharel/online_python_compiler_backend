@@ -1,70 +1,121 @@
 import json
-import docker
-import threading
-import logging
+import asyncio
+import subprocess
+import tempfile
 from channels.generic.websocket import AsyncWebsocketConsumer
+import logging
 
 logger = logging.getLogger(__name__)
 
-class DockerStatsConsumer(AsyncWebsocketConsumer):
+class CodeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        logger.info("WebSocket connection attempt")
-        try:
-            await self.accept()  # must be called before sending anything
-            self.client = docker.from_env()
-            self.container_id = self.scope['url_route']['kwargs']['container_id']
-            self.stop_event = threading.Event()
-
-            self.thread = threading.Thread(
-                target=self.send_stats,
-                args=(self.container_id, self.stop_event)
-            )
-            self.thread.start()
-
-            logger.info("WebSocket connected and thread started")
-        except Exception as e:
-            logger.error(f"Error during connection setup: {str(e)}")
-            await self.close(code=3000)  # custom close code
+        self.process = None
+        self.input_queue = asyncio.Queue()
+        self.is_running = False
+        self.current_code = None
+        await self.accept()  # Accept first
+        logger.info("WebSocket connected")
 
     async def disconnect(self, close_code):
-        logger.info(f"WebSocket disconnected with code {close_code}")
-        try:
-            self.stop_event.set()
-            if hasattr(self, 'thread') and self.thread.is_alive():
-                self.thread.join()
-            logger.info("Thread stopped and joined successfully")
-        except Exception as e:
-            logger.warning(f"Error during disconnect cleanup: {str(e)}")
+        logger.info(f"WebSocket disconnected with code: {close_code}")
+        await self.cleanup_process()
 
-    def send_stats(self, container_id, stop_event):
+    async def receive(self, text_data):
+        logger.info(f"Received message: {text_data}")
         try:
-            container = self.client.containers.get(container_id)
-            for stat in container.stats(decode=True, stream=True):
-                if stop_event.is_set():
+            data = json.loads(text_data)
+            if 'ping' in data:
+                return
+            if 'code' in data:
+                if self.is_running:
+                    await self.cleanup_process()
+                await self.execute_code(data['code'])
+            elif 'input' in data:
+                if self.is_running and self.process:
+                    await self.input_queue.put(data['input'])
+                else:
+                    await self.send(text_data=json.dumps({'error': 'No active process'}))
+            else:
+                await self.send(text_data=json.dumps({'error': 'Invalid message'}))
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {str(e)}")
+            await self.send(text_data=json.dumps({'error': f'Invalid JSON: {str(e)}'}))
+            await self.close(code=3000)
+
+    async def execute_code(self, code):
+        logger.info("Executing code")
+        self.current_code = code
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
+                temp_file.write(code.encode())
+                temp_file.flush()
+                self.process = await asyncio.create_subprocess_exec(
+                    'stdbuf', '-oL', 'python3', '-u', temp_file.name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
+                    env={'PYTHONUNBUFFERED': '1'}
+                )
+            self.is_running = True
+            asyncio.create_task(self.stream_output())
+            asyncio.create_task(self.process_input())
+        except Exception as e:
+            logger.error(f"Execution error: {str(e)}")
+            await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
+            await self.cleanup_process()
+
+    async def stream_output(self):
+        try:
+            while self.is_running and self.process and self.process.returncode is None:
+                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=3)
+                if not stdout:
                     break
+                output = stdout.decode().strip()
+                if output:
+                    formatted_output = output + ' >>>' if 'input' in self.current_code.lower() else output
+                    logger.info(f"Sending output: {formatted_output}")
+                    await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
 
-                # CPU usage
-                cpu_total = stat["cpu_stats"]["cpu_usage"]["total_usage"]
-                cpu_system = stat["cpu_stats"]["system_cpu_usage"]
-                cpu_percent = 0.0
-
-                if cpu_system > 0:
-                    cpu_percent = (cpu_total / cpu_system) * 100.0
-
-                # Memory usage
-                mem_usage = stat["memory_stats"]["usage"]
-                mem_limit = stat["memory_stats"]["limit"]
-                mem_percent = (mem_usage / mem_limit) * 100.0
-
-                data = {
-                    "cpu": round(cpu_percent, 2),
-                    "memory": round(mem_percent, 2)
-                }
-
-                # Send stats asynchronously to WebSocket
-                from asgiref.sync import async_to_sync
-                async_to_sync(self.send)(text_data=json.dumps(data))
+                try:
+                    stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
+                    if stderr:
+                        error = stderr.decode().strip()
+                        if error:
+                            logger.info(f"Sending error: {error}")
+                            await self.send(text_data=json.dumps({'output': error + '\n'}))
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.TimeoutError:
+            logger.info("Stream timeout")
         except Exception as e:
-            logger.error(f"Error while sending stats: {str(e)}")
-            from asgiref.sync import async_to_sync
-            async_to_sync(self.send)(text_data=json.dumps({"error": str(e)}))
+            logger.error(f"Stream error: {str(e)}")
+            await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
+        finally:
+            await self.cleanup_process()
+
+    async def process_input(self):
+        try:
+            while self.is_running and self.process and self.process.returncode is None:
+                input_data = await self.input_queue.get()
+                if self.process.stdin:
+                    self.process.stdin.write((input_data + '\n').encode())
+                    await self.process.stdin.drain()
+                    logger.info(f"Sent input: {input_data}")
+                self.input_queue.task_done()
+        except Exception as e:
+            logger.error(f"Input error: {str(e)}")
+            await self.send(text_data=json.dumps({'error': f'Input error: {str(e)}'}))
+        finally:
+            await self.cleanup_process()
+
+    async def cleanup_process(self):
+        if self.process and self.process.returncode is None:
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=2)
+            except Exception as e:
+                logger.error(f"Cleanup error: {str(e)}")
+        self.process = None
+        self.is_running = False
+        self.current_code = None
+        logger.info("Cleanup completed")
