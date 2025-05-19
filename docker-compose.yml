@@ -11,6 +11,7 @@ services:
       - REDIS_HOST=redis
     depends_on:
       - redis
+    command: daphne -b 0.0.0.0 -p 8000 codebuddy.asgi:application
 
   redis:
     image: redis:7
@@ -19,3 +20,4 @@ services:
 
 volumes:
   db_data:
+
