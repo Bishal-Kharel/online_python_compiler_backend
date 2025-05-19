@@ -30,14 +30,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         logger.info(f"WebSocket disconnected with code: {close_code}")
         await self.cleanup_process()
-        self.is_running = False
 
     async def receive(self, text_data):
         logger.info(f"Received WebSocket message: {text_data}")
         try:
             data = json.loads(text_data)
             if 'ping' in data:
-                return  # Ignore ping messages
+                return
             if 'code' in data:
                 if (self.current_code == data['code'] and self.is_running and 
                     self.process and self.input_queue.empty()):
@@ -72,15 +71,22 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.input_count = len(re.findall(r'\binput\s*\(', code))
         self.input_processed = 0
         try:
+            # Inject sys.stdout.flush() after input() calls
+            modified_code = re.sub(
+                r'(input\s*\([^)]*\))',
+                r'\1; import sys; sys.stdout.flush()',
+                code
+            )
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
-                temp_file.write(code.encode())
+                temp_file.write(modified_code.encode())
                 temp_file.flush()
                 self.process = await asyncio.create_subprocess_exec(
                     'python', '-u', temp_file.name,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
-                    close_fds=True
+                    close_fds=True,
+                    env={'PYTHONUNBUFFERED': '1'}
                 )
             self.is_running = True
             self._output_task = asyncio.create_task(self.stream_output())
@@ -95,7 +101,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
             while self.is_running and self.process and self.process.returncode is None:
                 try:
                     # Read stdout
-                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=60)
+                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=10)
                     if not stdout:
                         if self.current_code and self.input_count > self.input_processed:
                             await asyncio.sleep(0.1)
@@ -130,8 +136,11 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     except asyncio.TimeoutError:
                         pass
                 except asyncio.TimeoutError:
-                    logger.warning("Timeout in stream_output, continuing")
-                    continue
+                    if self.input_count > self.input_processed:
+                        logger.info("Waiting for input, continuing")
+                        continue
+                    logger.info("Output stream timeout, stopping")
+                    break
                 except Exception as e:
                     logger.error(f"Error streaming output: {str(e)}")
                     await self.send(text_data=json.dumps({'error': f'Streaming error: {str(e)}'}))
@@ -160,6 +169,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     break
                 finally:
                     self.input_queue.task_done()
+                    # Trigger stdout flush after input
+                    if self.process and self.process.stdin:
+                        try:
+                            self.process.stdin.write(b'import sys; sys.stdout.flush()\n')
+                            await self.process.stdin.drain()
+                        except Exception as e:
+                            logger.error(f"Error flushing stdout: {str(e)}")
             logger.info("Input processing stopped")
         except asyncio.CancelledError:
             logger.info("Input processing task cancelled")
@@ -181,7 +197,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         if self.process:
             try:
                 if self.process.stdout:
-                    await self.process.stdout.read()  # Drain remaining output
+                    await self.process.stdout.read()
                 if self.process.stderr:
                     await self.process.stderr.read()
                 logger.info("Process streams drained")
