@@ -5,7 +5,6 @@ import tempfile
 import re
 from channels.generic.websocket import AsyncWebsocketConsumer
 import logging
-import socket
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +12,14 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         logger.info("WebSocket connection attempt")
         try:
-            # Initialize attributes
             self.process = None
             self.input_queue = asyncio.Queue()
             self.is_running = False
             self.current_code = None
             self.input_count = 0
             self.input_processed = 0
+            self._output_task = None
+            self._input_task = None
             await self.accept()
             logger.info("WebSocket connected")
             await self.send(text_data=json.dumps({'message': 'WebSocket connection established'}))
@@ -77,8 +77,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     stdin=asyncio.subprocess.PIPE
                 )
             self.is_running = True
-            asyncio.create_task(self.stream_output())
-            asyncio.create_task(self.process_input())
+            self._output_task = asyncio.create_task(self.stream_output())
+            self._input_task = asyncio.create_task(self.process_input())
         except Exception as e:
             logger.error(f"Execution error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
@@ -86,7 +86,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
 
     async def stream_output(self):
         try:
-            while self.is_running:
+            while self.is_running and self.process:
                 try:
                     # Check process status
                     if self.process.returncode is not None:
@@ -141,19 +141,25 @@ class CodeConsumer(AsyncWebsocketConsumer):
 
     async def process_input(self):
         try:
-            while self.is_running:
+            while self.is_running and self.process:
                 input_data = await self.input_queue.get()
                 if not input_data.endswith('\n'):
                     input_data += '\n'
                 try:
-                    await self.process.stdin.write(input_data.encode())
-                    await self.process.stdin.drain()
-                    logger.info(f"Sent input: {input_data.strip()}")
+                    if self.process.stdin:
+                        self.process.stdin.write(input_data.encode())
+                        await self.process.stdin.drain()
+                        logger.info(f"Sent input: {input_data.strip()}")
+                    else:
+                        logger.error("Stdin is closed or unavailable")
+                        await self.send(text_data=json.dumps({'error': 'Cannot send input: stdin unavailable'}))
                 except Exception as e:
                     logger.error(f"Error sending input: {str(e)}")
                     await self.send(text_data=json.dumps({'error': f'Input error: {str(e)}'}))
                 finally:
                     self.input_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Input processing task cancelled")
         except Exception as e:
             logger.error(f"Error in process_input: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Input processing error: {str(e)}'}))
@@ -164,11 +170,28 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def cleanup_process(self):
         if self.process:
             try:
-                self.process.terminate()
-                await asyncio.wait_for(self.process.wait(), timeout=1)
+                if self.process.returncode is None:
+                    self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), timeout=1)
+                logger.info("Process cleaned up")
             except Exception as e:
                 logger.error(f"Error cleaning up process: {str(e)}")
-            self.process = None
+            finally:
+                self.process = None
+        if self._output_task:
+            self._output_task.cancel()
+            try:
+                await self._output_task
+            except asyncio.CancelledError:
+                pass
+            self._output_task = None
+        if self._input_task:
+            self._input_task.cancel()
+            try:
+                await self._input_task
+            except asyncio.CancelledError:
+                pass
+            self._input_task = None
         self.is_running = False
         self.current_code = None
         self.input_count = 0
