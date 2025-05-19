@@ -5,7 +5,7 @@ import asyncio
 import socket
 from channels.generic.websocket import AsyncWebsocketConsumer
 import logging
-from docker.errors import APIError
+from docker.errors import APIError, DockerException
 import re
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,14 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         logger.info("WebSocket connection attempt")
         try:
-            self.client = docker.from_env()
+            # Initialize Docker client
+            try:
+                self.client = docker.from_env()
+                self.client.ping()  # Test Docker connection
+            except DockerException as e:
+                logger.error(f"Docker initialization failed: {str(e)}")
+                raise Exception(f"Docker unavailable: {str(e)}")
+
             self.container = None
             self.exec_id = None
             self.exec_socket = None
@@ -25,9 +32,10 @@ class CodeConsumer(AsyncWebsocketConsumer):
             self.input_processed = 0
             await self.accept()
             logger.info("WebSocket connected")
+            await self.send(text_data=json.dumps({'message': 'WebSocket connection established'}))
         except Exception as e:
             logger.error(f"Connection failed: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Connection failed: {str(e)}'}))
+            await self.close(code=3000, reason=f'Connection failed: {str(e)}')
             await self.close(code=3000)
 
     async def disconnect(self, close_code):
