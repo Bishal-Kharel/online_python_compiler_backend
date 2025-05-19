@@ -71,17 +71,11 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.input_count = len(re.findall(r'\binput\s*\(', code))
         self.input_processed = 0
         try:
-            # Inject sys.stdout.flush() after input() calls
-            modified_code = re.sub(
-                r'(input\s*\([^)]*\))',
-                r'\1; import sys; sys.stdout.flush()',
-                code
-            )
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
-                temp_file.write(modified_code.encode())
+                temp_file.write(code.encode())
                 temp_file.flush()
                 self.process = await asyncio.create_subprocess_exec(
-                    'python', '-u', temp_file.name,
+                    'python3', '-u', temp_file.name,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
@@ -100,7 +94,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 try:
-                    # Read stdout
                     stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=10)
                     if not stdout:
                         if self.current_code and self.input_count > self.input_processed:
@@ -124,7 +117,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
                         logger.info(f"Sending output: {formatted_output}")
                         await self.send(text_data=json.dumps({'output': formatted_output}))
 
-                    # Read stderr
                     try:
                         stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
                         if stderr:
@@ -169,13 +161,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     break
                 finally:
                     self.input_queue.task_done()
-                    # Trigger stdout flush after input
-                    if self.process and self.process.stdin:
-                        try:
-                            self.process.stdin.write(b'import sys; sys.stdout.flush()\n')
-                            await self.process.stdin.drain()
-                        except Exception as e:
-                            logger.error(f"Error flushing stdout: {str(e)}")
             logger.info("Input processing stopped")
         except asyncio.CancelledError:
             logger.info("Input processing task cancelled")
