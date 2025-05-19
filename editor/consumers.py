@@ -2,6 +2,7 @@ import json
 import asyncio
 import subprocess
 import tempfile
+import re
 from channels.generic.websocket import AsyncWebsocketConsumer
 import logging
 
@@ -13,7 +14,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.input_queue = asyncio.Queue()
         self.is_running = False
         self.current_code = None
-        await self.accept()  # Accept first
+        await self.accept()
         logger.info("WebSocket connected")
 
     async def disconnect(self, close_code):
@@ -46,8 +47,17 @@ class CodeConsumer(AsyncWebsocketConsumer):
         logger.info("Executing code")
         self.current_code = code
         try:
+            # Wrap code to force flush after input
+            wrapper_code = (
+                "import sys\n"
+                "def flush_input(prompt=''):\n"
+                "    result = input(prompt)\n"
+                "    sys.stdout.flush()\n"
+                "    return result\n"
+                f"{code.replace('input(', 'flush_input(')}"
+            )
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
-                temp_file.write(code.encode())
+                temp_file.write(wrapper_code.encode())
                 temp_file.flush()
                 self.process = await asyncio.create_subprocess_exec(
                     'stdbuf', '-oL', 'python3', '-u', temp_file.name,
@@ -67,9 +77,9 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def stream_output(self):
         try:
             while self.is_running and self.process and self.process.returncode is None:
-                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=3)
+                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=8)
                 if not stdout:
-                    break
+                    continue
                 output = stdout.decode().strip()
                 if output:
                     formatted_output = output + ' >>>' if 'input' in self.current_code.lower() else output
@@ -86,7 +96,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 except asyncio.TimeoutError:
                     pass
         except asyncio.TimeoutError:
-            logger.info("Stream timeout")
+            logger.info("Stream timeout, continuing")
         except Exception as e:
             logger.error(f"Stream error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
