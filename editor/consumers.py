@@ -12,6 +12,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.process = None
         self.input_queue = asyncio.Queue()
         self.is_running = False
+        self.current_code = None
         await self.accept()
         logger.info("WebSocket connected")
 
@@ -23,6 +24,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
         logger.info(f"Received message: {text_data}")
         try:
             data = json.loads(text_data)
+            if 'ping' in data:
+                return
             if 'code' in data:
                 if self.is_running:
                     await self.cleanup_process()
@@ -40,12 +43,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
 
     async def execute_code(self, code):
         logger.info("Executing code")
+        self.current_code = code
         try:
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
                 temp_file.write(code.encode())
                 temp_file.flush()
                 self.process = await asyncio.create_subprocess_exec(
-                    'python3', '-u', temp_file.name,
+                    'stdbuf', '-oL', 'python3', '-u', temp_file.name,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
@@ -62,12 +66,12 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def stream_output(self):
         try:
             while self.is_running and self.process and self.process.returncode is None:
-                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=5)
+                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=3)
                 if not stdout:
                     break
                 output = stdout.decode().strip()
                 if output:
-                    formatted_output = output + ' >>> ' if 'input' in self.current_code else output
+                    formatted_output = output + ' >>>' if 'input' in self.current_code.lower() else output
                     logger.info(f"Sending output: {formatted_output}")
                     await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
 
@@ -112,4 +116,5 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 logger.error(f"Cleanup error: {str(e)}")
         self.process = None
         self.is_running = False
+        self.current_code = None
         logger.info("Cleanup completed")
