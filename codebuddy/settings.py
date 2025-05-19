@@ -88,3 +88,5 @@ CHANNEL_LAYERS = {
         },
     },
 }
+
+STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
