@@ -21,6 +21,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.processed_inputs = 0
         self.temp_file_path = None
         self.pty_fd = None
+        self.output_received = False
         await self.accept()
         logger.info("WebSocket connected")
 
@@ -64,6 +65,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.expecting_input = 'input(' in code.lower()
         self.input_count = code.lower().count('input(')
         self.processed_inputs = 0
+        self.output_received = False
         temp_dir = '/tmp'
         try:
             with tempfile.NamedTemporaryFile(suffix='.py', dir=temp_dir, delete=False) as temp_file:
@@ -100,22 +102,39 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 try:
                     rlist, _, _ = select.select([self.pty_fd], [], [], 30)
                     if self.pty_fd in rlist:
-                        output = os.read(self.pty_fd, 1024).decode('utf-8', errors='replace').strip()
-                        if output:
-                            formatted_output = output
-                            if self.expecting_input and self.processed_inputs < self.input_count:
-                                formatted_output = output + ' >>>'
-                            logger.info(f"Sending output: {formatted_output}")
-                            await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
+                        try:
+                            output = os.read(self.pty_fd, 1024).decode('utf-8', errors='replace').strip()
+                            if output:
+                                self.output_received = True
+                                formatted_output = output
+                                if self.expecting_input and self.processed_inputs < self.input_count:
+                                    formatted_output = output + ' >>>'
+                                logger.info(f"Sending output: {formatted_output}")
+                                for attempt in range(3):  # Retry sending up to 3 times
+                                    try:
+                                        await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
+                                        break
+                                    except Exception as send_err:
+                                        logger.warning(f"Send attempt {attempt + 1} failed: {str(send_err)}")
+                                        if attempt == 2:
+                                            raise send_err
+                                        await asyncio.sleep(0.1)
+                        except OSError as e:
+                            if e.errno == 5 and self.output_received and not self.expecting_input:
+                                logger.info("Ignoring I/O error after successful output for non-input code")
+                                break
+                            raise
                     else:
                         logger.warning("No output received, continuing to wait")
                 except Exception as e:
                     logger.error(f"Stream error: {str(e)}")
-                    await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
+                    if not (self.output_received and not self.expecting_input):
+                        await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
                     break
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
-                await self.send(text_data=json.dumps({'output': f'\nProcess exited with code {self.process.returncode}\n'}))
+                if self.output_received or self.expecting_input:
+                    await self.send(text_data=json.dumps({'output': f'\nProcess exited with code {self.process.returncode}\n'}))
         finally:
             await self.cleanup_process()
 
@@ -124,12 +143,17 @@ class CodeConsumer(AsyncWebsocketConsumer):
             while self.is_running and self.process and self.process.returncode is None:
                 input_data = await self.input_queue.get()
                 if self.pty_fd is not None:
-                    os.write(self.pty_fd, input_data.encode('utf-8'))
-                    logger.info(f"Sent input: {input_data.strip()}")
-                    self.processed_inputs += 1
-                    self.expecting_input = self.processed_inputs < self.input_count
+                    try:
+                        os.write(self.pty_fd, input_data.encode('utf-8'))
+                        logger.info(f"Sent input: {input_data.strip()}")
+                        self.processed_inputs += 1
+                        self.expecting_input = self.processed_inputs < self.input_count
+                    except OSError as e:
+                        logger.error(f"Input write error: {str(e)}")
+                        await self.send(text_data=json.dumps({'error': f'Input error: {str(e)}'}))
+                        break
                 self.input_queue.task_done()
-            if self.process and self.process.returncode is None:
+            if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
         except Exception as e:
             logger.error(f"Input error: {str(e)}")
@@ -138,8 +162,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
             await self.cleanup_process()
 
     async def watchdog(self):
-        await asyncio.sleep(60)  # Wait 60 seconds
-        if self.is_running and self.process and self.process.returncode is None and self.processed_inputs == 0:
+        await asyncio.sleep(30)  # Reduced to 30 seconds
+        if self.is_running and self.process and self.process.returncode is None and not self.output_received:
             logger.warning("Watchdog: Process stalled, terminating")
             await self.send(text_data=json.dumps({'error': 'Process stalled, terminated'}))
             await self.cleanup_process()
@@ -170,6 +194,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.expecting_input = False
         self.input_count = 0
         self.processed_inputs = 0
+        self.output_received = False
         if self.temp_file_path and os.path.exists(self.temp_file_path):
             try:
                 os.unlink(self.temp_file_path)
