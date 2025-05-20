@@ -84,7 +84,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
             self.is_running = True
             asyncio.create_task(self.stream_output())
             asyncio.create_task(self.process_input())
-            # Watchdog to detect stalls
             asyncio.create_task(self.watchdog())
         except PermissionError as e:
             logger.error(f"Permission error: {str(e)}")
@@ -130,7 +129,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     self.processed_inputs += 1
                     self.expecting_input = self.processed_inputs < self.input_count
                 self.input_queue.task_done()
-            if self.process and self.process.returncode is not None:
+            if self.process and self.process.returncode is None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
         except Exception as e:
             logger.error(f"Input error: {str(e)}")
@@ -163,4 +162,25 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 os.close(self.pty_fd)
                 logger.info("Closed PTY FD")
             except Exception as e:
-                logger.error(f"Failed
+                logger.error(f"Failed to close PTY FD: {str(e)}")
+        self.process = None
+        self.pty_fd = None
+        self.is_running = False
+        self.current_code = None
+        self.expecting_input = False
+        self.input_count = 0
+        self.processed_inputs = 0
+        if self.temp_file_path and os.path.exists(self.temp_file_path):
+            try:
+                os.unlink(self.temp_file_path)
+                logger.info(f"Deleted temp file: {self.temp_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to delete temp file {self.temp_file_path}: {str(e)}")
+        self.temp_file_path = None
+        while not self.input_queue.empty():
+            try:
+                self.input_queue.get_nowait()
+                self.input_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        logger.info("Cleanup completed")
