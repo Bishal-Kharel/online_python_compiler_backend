@@ -3,7 +3,7 @@ djangorestframework==3.15.2
 channels==4.1.0 
 channels-redis==4.2.0 
 daphne==4.1.2 
-docker==7.1.0 
 Pillow==10.4.0 
 django-cors-headers==4.4.0
 python-decouple
+psutil==6.0.0
