@@ -2,6 +2,7 @@ import json
 import asyncio
 import subprocess
 import tempfile
+import os
 from channels.generic.websocket import AsyncWebsocketConsumer
 import logging
 
@@ -34,7 +35,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 if self.is_running:
                     await self.send(text_data=json.dumps({'error': 'Another process is running, please wait'}))
                     return
-                await self.cleanup_process()  # Ensure clean state
+                await self.cleanup_process()
                 await self.execute_code(data['code'])
             elif 'input' in data:
                 if self.is_running and self.process and self.process.returncode is None:
@@ -59,9 +60,10 @@ class CodeConsumer(AsyncWebsocketConsumer):
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
                 temp_file.write(code.encode())
                 temp_file.flush()
-                logger.info(f"Starting subprocess for file: {temp_file.name}")
+                temp_file_path = temp_file.name
+                logger.info(f"Starting subprocess for file: {temp_file_path}")
                 self.process = await asyncio.create_subprocess_exec(
-                    'stdbuf', '-oL', 'python3', '-u', temp_file.name,
+                    'stdbuf', '-oL', 'python3', '-u', temp_file_path,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
@@ -74,19 +76,24 @@ class CodeConsumer(AsyncWebsocketConsumer):
             logger.error(f"Execution error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
             await self.cleanup_process()
+        finally:
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception as e:
+                    logger.error(f"Failed to delete temp file {temp_file_path}: {str(e)}")
 
     async def stream_output(self):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 try:
-                    # Disable timeout when expecting input
                     timeout = None if self.expecting_input else 60
                     stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=timeout)
                     if stdout:
                         output = stdout.decode().strip()
                         if output:
                             formatted_output = output
-                            if self.expecting_input:
+                            if self.expecting_input and self.processed_inputs < self.input_count:
                                 formatted_output = output + ' >>>'
                             logger.info(f"Sending output: {formatted_output}")
                             await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
@@ -97,7 +104,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                             error = stderr.decode().strip()
                             if error:
                                 logger.info(f"Sending error: {error}")
-                                await self.send(text_data=json.dumps({'output': error + '\n'}))
+                                await self.send(text_data=json.dumps({'error': error + '\n'}))
                                 self.expecting_input = False
                     except asyncio.TimeoutError:
                         pass
