@@ -14,6 +14,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.is_running = False
         self.current_code = None
         self.expecting_input = False
+        self.input_count = 0
+        self.processed_inputs = 0
         await self.accept()
         logger.info("WebSocket connected")
 
@@ -29,11 +31,14 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 await self.send(text_data=json.dumps({'pong': True}))
                 return
             if 'code' in data:
+                if self.is_running:
+                    await self.send(text_data=json.dumps({'error': 'Another process is running, please wait'}))
+                    return
                 await self.cleanup_process()  # Ensure clean state
                 await self.execute_code(data['code'])
             elif 'input' in data:
                 if self.is_running and self.process and self.process.returncode is None:
-                    await self.input_queue.put(data['input'] + '\n')  # Add newline for input
+                    await self.input_queue.put(data['input'] + '\n')
                 else:
                     logger.warning("Received input but no active process")
                     await self.send(text_data=json.dumps({'error': 'No active process'}))
@@ -48,6 +53,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
         logger.info(f"Executing code: {code}")
         self.current_code = code
         self.expecting_input = 'input(' in code.lower()
+        self.input_count = code.lower().count('input(')
+        self.processed_inputs = 0
         try:
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
                 temp_file.write(code.encode())
@@ -72,18 +79,18 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 try:
-                    # Increase timeout to 60 seconds to allow for user input
-                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=60)
+                    # Disable timeout when expecting input
+                    timeout = None if self.expecting_input else 60
+                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=timeout)
                     if stdout:
                         output = stdout.decode().strip()
                         if output:
                             formatted_output = output
-                            if self.expecting_input and 'input(' in self.current_code.lower():
+                            if self.expecting_input:
                                 formatted_output = output + ' >>>'
                             logger.info(f"Sending output: {formatted_output}")
                             await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
                     
-                    # Check stderr
                     try:
                         stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
                         if stderr:
@@ -117,11 +124,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     self.process.stdin.write(input_data.encode())
                     await self.process.stdin.drain()
                     logger.info(f"Sent input: {input_data.strip()}")
-                    # Update expecting_input based on remaining input() calls
-                    if self.current_code:
-                        input_count = self.current_code.lower().count('input(')
-                        processed_inputs = self.current_code.lower()[:self.current_code.lower().index('input(')].count('\n') + 1
-                        self.expecting_input = input_count > processed_inputs
+                    self.processed_inputs += 1
+                    self.expecting_input = self.processed_inputs < self.input_count
                 self.input_queue.task_done()
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
@@ -148,6 +152,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.is_running = False
         self.current_code = None
         self.expecting_input = False
+        self.input_count = 0
+        self.processed_inputs = 0
         while not self.input_queue.empty():
             try:
                 self.input_queue.get_nowait()
