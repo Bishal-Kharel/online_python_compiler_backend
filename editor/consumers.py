@@ -31,21 +31,25 @@ class CodeConsumer(AsyncWebsocketConsumer):
             data = json.loads(text_data)
             if 'ping' in data:
                 await self.send(text_data=json.dumps({'pong': True}))
+                logger.info("Sent pong")
                 return
             if 'code' in data:
                 if self.is_running:
                     await self.send(text_data=json.dumps({'error': 'Another process is running, please wait'}))
+                    logger.info("Rejected code: process already running")
                     return
                 await self.cleanup_process()
                 await self.execute_code(data['code'])
             elif 'input' in data:
                 if self.is_running and self.process and self.process.returncode is None:
                     await self.input_queue.put(data['input'] + '\n')
+                    logger.info(f"Queued input: {data['input']}")
                 else:
                     logger.warning("Received input but no active process")
                     await self.send(text_data=json.dumps({'error': 'No active process'}))
             else:
                 await self.send(text_data=json.dumps({'error': 'Invalid message'}))
+                logger.warning("Received invalid message")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Invalid JSON: {str(e)}'}))
@@ -68,7 +72,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
-                    env={'PYTHONUNBUFFERED': '1'}
+                    env={'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'utf-8'}
                 )
             self.is_running = True
             asyncio.create_task(self.stream_output())
@@ -82,7 +86,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 try:
-                    timeout = None if self.expecting_input else 60
+                    timeout = 120 if self.expecting_input else 60  # Longer timeout for input
                     stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=timeout)
                     if stdout:
                         output = stdout.decode().strip()
@@ -104,11 +108,9 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     except asyncio.TimeoutError:
                         pass
                 except asyncio.TimeoutError:
-                    logger.info("Stream timeout, checking process")
-                    if self.process and self.process.returncode is not None:
-                        logger.info(f"Process exited with returncode: {self.process.returncode}")
-                        break
-                    continue
+                    logger.warning("Stream timeout, terminating process")
+                    await self.send(text_data=json.dumps({'error': 'Process timed out waiting for output or input'}))
+                    break
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
                 await self.send(text_data=json.dumps({'output': f'\nProcess exited with code {self.process.returncode}\n'}))
@@ -167,6 +169,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
             try:
                 self.input_queue.get_nowait()
                 self.input_queue.task_done()
-            except asyncio.QueueEmpty:
+            except Asyncio.QueueEmpty:
                 break
         logger.info("Cleanup completed")
