@@ -26,14 +26,16 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             data = json.loads(text_data)
             if 'ping' in data:
+                await self.send(text_data=json.dumps({'pong': True}))
                 return
             if 'code' in data:
                 await self.cleanup_process()  # Ensure clean state
                 await self.execute_code(data['code'])
             elif 'input' in data:
                 if self.is_running and self.process and self.process.returncode is None:
-                    await self.input_queue.put(data['input'])
+                    await self.input_queue.put(data['input'] + '\n')  # Add newline for input
                 else:
+                    logger.warning("Received input but no active process")
                     await self.send(text_data=json.dumps({'error': 'No active process'}))
             else:
                 await self.send(text_data=json.dumps({'error': 'Invalid message'}))
@@ -69,40 +71,38 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def stream_output(self):
         try:
             while self.is_running and self.process and self.process.returncode is None:
-                stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=20)
-                if not stdout:
-                    logger.debug("Empty stdout, checking process")
-                    if self.process.returncode is not None:
+                try:
+                    # Increase timeout to 60 seconds to allow for user input
+                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=60)
+                    if stdout:
+                        output = stdout.decode().strip()
+                        if output:
+                            formatted_output = output
+                            if self.expecting_input and 'input(' in self.current_code.lower():
+                                formatted_output = output + ' >>>'
+                            logger.info(f"Sending output: {formatted_output}")
+                            await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
+                    
+                    # Check stderr
+                    try:
+                        stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
+                        if stderr:
+                            error = stderr.decode().strip()
+                            if error:
+                                logger.info(f"Sending error: {error}")
+                                await self.send(text_data=json.dumps({'output': error + '\n'}))
+                                self.expecting_input = False
+                    except asyncio.TimeoutError:
+                        pass
+                except asyncio.TimeoutError:
+                    logger.info("Stream timeout, checking process")
+                    if self.process and self.process.returncode is not None:
                         logger.info(f"Process exited with returncode: {self.process.returncode}")
                         break
                     continue
-                output = stdout.decode().strip()
-                if output:
-                    # Add >>> only for input prompts
-                    formatted_output = output
-                    if self.expecting_input and 'input(' in self.current_code.lower() and not output.startswith('You entered:'):
-                        formatted_output = output + ' >>>'
-                    else:
-                        self.expecting_input = False  # Reset after non-prompt output
-                    logger.info(f"Sending output: {formatted_output}")
-                    await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
-
-                try:
-                    stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
-                    if stderr:
-                        error = stderr.decode().strip()
-                        if error:
-                            logger.info(f"Sending error: {error}")
-                            await self.send(text_data=json.dumps({'output': error + '\n'}))
-                            self.expecting_input = False
-                except asyncio.TimeoutError:
-                    pass
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
-        except asyncio.TimeoutError:
-            logger.info("Stream timeout, checking process")
-            if self.process and self.process.returncode is not None:
-                logger.info(f"Process exited with returncode: {self.process.returncode}")
+                await self.send(text_data=json.dumps({'output': f'\nProcess exited with code {self.process.returncode}\n'}))
         except Exception as e:
             logger.error(f"Stream error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
@@ -113,11 +113,15 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 input_data = await self.input_queue.get()
-                if self.process and self.process.stdin:
-                    self.process.stdin.write((input_data + '\n').encode())
+                if self.process and self.process.stdin and self.process.returncode is None:
+                    self.process.stdin.write(input_data.encode())
                     await self.process.stdin.drain()
-                    logger.info(f"Sent input: {input_data}")
-                    self.expecting_input = 'input(' in self.current_code.lower() and self.current_code.count('input(') > self.input_queue.qsize()
+                    logger.info(f"Sent input: {input_data.strip()}")
+                    # Update expecting_input based on remaining input() calls
+                    if self.current_code:
+                        input_count = self.current_code.lower().count('input(')
+                        processed_inputs = self.current_code.lower()[:self.current_code.lower().index('input(')].count('\n') + 1
+                        self.expecting_input = input_count > processed_inputs
                 self.input_queue.task_done()
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
@@ -131,8 +135,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
         if self.process and self.process.returncode is None:
             try:
                 self.process.terminate()
-                await asyncio.wait_for(self.process.wait(), timeout=2)
-                logger.info(f"Terminated process, returncode: {self.process.returncode}")
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=2)
+                    logger.info(f"Terminated process, returncode: {self.process.returncode}")
+                except asyncio.TimeoutError:
+                    logger.warning("Process did not terminate gracefully, killing")
+                    self.process.kill()
+                    await self.process.wait()
             except Exception as e:
                 logger.error(f"Cleanup error: {str(e)}")
         self.process = None
@@ -140,6 +149,9 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.current_code = None
         self.expecting_input = False
         while not self.input_queue.empty():
-            self.input_queue.get_nowait()
-            self.input_queue.task_done()
+            try:
+                self.input_queue.get_nowait()
+                self.input_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
         logger.info("Cleanup completed")
