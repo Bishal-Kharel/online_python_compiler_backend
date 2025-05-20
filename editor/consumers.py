@@ -1,227 +1,124 @@
 import json
-import docker
-import base64
+import sys
 import asyncio
-import socket
+from io import StringIO
 from channels.generic.websocket import AsyncWebsocketConsumer
-import logging
-from docker.errors import APIError
-import re
 
-logger = logging.getLogger(__name__)
-
-class CodeConsumer(AsyncWebsocketConsumer):
+class CodeExecutionConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        logger.info("WebSocket connection attempt")
-        try:
-            self.client = docker.from_env()
-            self.container = None
-            self.exec_id = None
-            self.exec_socket = None
-            self.input_queue = asyncio.Queue()
-            self.is_running = False
-            self.current_code = None
-            self.input_count = 0
-            self.input_processed = 0
-            await self.accept()
-            logger.info("WebSocket connected")
-        except Exception as e:
-            logger.error(f"Connection failed: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Connection failed: {str(e)}'}))
-            await self.close(code=3000)
-
-    async def disconnect(self, close_code):
-        logger.info(f"WebSocket disconnected with code: {close_code}")
-        await self.cleanup_container()
-        self.is_running = False
+        await self.accept()
+        self.gen = None
+        self.waiting_for_input = False
+        await self.send(text_data=json.dumps({
+            'output': 'Send your code in JSON: {"code": "..."}'
+        }))
 
     async def receive(self, text_data):
-        logger.info(f"Received WebSocket message: {text_data}")
-        try:
-            data = json.loads(text_data)
-            if 'code' in data:
-                # Reuse container if same code and waiting for input
-                if (self.current_code == data['code'] and self.is_running and 
-                    self.exec_id and self.input_queue.empty()):
-                    logger.info("Same code received, continuing with existing container")
-                    await self.send(text_data=json.dumps({'output': 'Waiting for input >>> '}))
-                else:
-                    if self.is_running:
-                        await self.cleanup_container()
-                    await self.execute_code(data['code'])
-            elif 'input' in data:
-                if self.is_running and self.exec_id:
-                    await self.input_queue.put(data['input'])
-                    self.input_processed += 1
-                else:
-                    await self.send(text_data=json.dumps({'error': 'No active container for input'}))
-            else:
-                await self.send(text_data=json.dumps({'error': 'Invalid message format. Use {"code": "..."} or {"input": "..."}'}))
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Invalid message: {str(e)}'}))
-            await self.close(code=3000)
-        except Exception as e:
-            logger.error(f"Unexpected error in receive: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Unexpected error: {str(e)}'}))
+        data = json.loads(text_data)
 
-    async def execute_code(self, code):
-        logger.info("Executing code")
-        self.current_code = code
-        self.input_count = len(re.findall(r'\binput\s*\(', code))
-        self.input_processed = 0
-        try:
-            # Create container
-            self.container = self.client.containers.create(
-                'python:3.12-slim',
-                command='tail -f /dev/null',
-                tty=False,
-                stdin_open=True
-            )
-            self.container.start()
-            logger.info("Container started")
+        if 'code' in data:
+            # Reset state
+            self.gen = None
+            self.waiting_for_input = False
 
-            # Write code to /app/code.py
-            encoded_code = base64.b64encode(code.encode()).decode()
-            exec_result = self.container.exec_run(
-                ['sh', '-c', f'mkdir -p /app && echo "{encoded_code}" | base64 -d > /app/code.py'],
-                stdout=True,
-                stderr=True
-            )
-            if exec_result.exit_code != 0:
-                error_msg = exec_result.output.decode(errors='ignore')
-                logger.error(f"Failed to write code file: {error_msg}")
-                await self.send(text_data=json.dumps({'error': f'Failed to write code: {error_msg}'}))
-                await self.cleanup_container()
-                return
-
-            # Start interactive Python process
-            self.exec_id = self.client.api.exec_create(
-                self.container.id,
-                ['python', '-u', '/app/code.py'],
-                stdout=True,
-                stderr=True,
-                stdin=True,
-                tty=False
-            )['Id']
-
-            # Start streaming with socket
-            self.exec_socket = self.client.api.exec_start(
-                self.exec_id,
-                stream=True,
-                socket=True,
-                detach=False
-            )
-            self.exec_socket._sock.settimeout(60)
-            self.is_running = True
-
-            # Start tasks
-            asyncio.create_task(self.stream_output())
-            asyncio.create_task(self.process_input())
-
-        except APIError as e:
-            logger.error(f"Failed to start container or execution: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
-            await self.cleanup_container()
-        except Exception as e:
-            logger.error(f"Unexpected error in execute_code: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Unexpected error: {str(e)}'}))
-            await self.cleanup_container()
-
-    async def stream_output(self):
-        try:
-            while self.is_running:
-                try:
-                    # Check process status
-                    if self.exec_id:
-                        inspect = self.client.api.exec_inspect(self.exec_id)
-                        if not inspect['Running']:
-                            logger.info("Python process exited")
-                            break
-
-                    # Read from socket
-                    chunk = await asyncio.get_event_loop().run_in_executor(
-                        None, self.exec_socket._sock.recv, 4096
-                    )
-                    if not chunk:
-                        if self.current_code and self.input_count > self.input_processed:
-                            await asyncio.sleep(0.1)
-                            continue
-                        logger.info("Execution stream closed")
-                        break
-                    output = chunk.decode(errors='ignore')
-                    output = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', output)
-                    if output:
-                        # Add prompt only for input() prompts
-                        formatted_output = output
-                        if self.input_count > self.input_processed:
-                            formatted_output = output.rstrip() + ' >>> '
-                        # Handle common errors
-                        if 'Traceback' in output:
-                            if 'SyntaxError' in output:
-                                formatted_output = 'Error: Check for missing colons, parentheses, or indentation.'
-                            elif 'NameError' in output:
-                                formatted_output = 'Error: You used a variable that wasn’t defined.'
-                            self.input_count = 0
-                            self.input_processed = 0
-                        logger.info(f"Sending output: {formatted_output}")
-                        await self.send(text_data=json.dumps({'output': formatted_output}))
-                except socket.timeout:
-                    logger.warning("Socket timeout in stream_output, continuing")
-                    continue
-                except Exception as e:
-                    logger.error(f"Error streaming output: {str(e)}")
-                    await self.send(text_data=json.dumps({'error': f'Streaming error: {str(e)}'}))
-                    break
-        finally:
-            if self.input_queue.empty() and self.exec_id:
-                inspect = self.client.api.exec_inspect(self.exec_id)
-                if not inspect['Running']:
-                    await self.cleanup_container()
-
-    async def process_input(self):
-        try:
-            while self.is_running:
-                input_data = await self.input_queue.get()
-                if not input_data.endswith('\n'):
-                    input_data += '\n'
-                try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, self.exec_socket._sock.send, input_data.encode()
-                    )
-                    logger.info(f"Sent input: {input_data.strip()}")
-                except Exception as e:
-                    logger.error(f"Error sending input: {str(e)}")
-                    await self.send(text_data=json.dumps({'error': f'Input error: {str(e)}'}))
-                finally:
-                    self.input_queue.task_done()
-        except Exception as e:
-            logger.error(f"Error in process_input: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Input processing error: {str(e)}'}))
-        finally:
-            if self.input_queue.empty() and self.exec_id:
-                inspect = self.client.api.exec_inspect(self.exec_id)
-                if not inspect['Running']:
-                    await self.cleanup_container()
-
-    async def cleanup_container(self):
-        if self.exec_socket:
+            user_code = data['code']
             try:
-                self.exec_socket._sock.settimeout(None)
-                self.exec_socket.close()
+                # Transform user code: replace input() with yield from input_replacement()
+                transformed_code = self._transform_input_calls(user_code)
+
+                # Prepare execution environment with input_replacement and print capturing
+                self.exec_env = {
+                    'input_replacement': self._input_replacement,
+                    '__builtins__': {
+                        'print': self._print,
+                        'range': range,
+                        'len': len,
+                        'int': int,
+                        'float': float,
+                        'str': str,
+                        'bool': bool,
+                        'list': list,
+                        'dict': dict,
+                        'set': set,
+                        'tuple': tuple,
+                        'enumerate': enumerate,
+                        'abs': abs,
+                        'min': min,
+                        'max': max,
+                        'sum': sum,
+                        # Add more safe built-ins if needed
+                    }
+                }
+                self.output_buffer = StringIO()
+                self._printed_output = ''
+
+                # Wrap code in a generator function named user_code_gen
+                wrapped_code = f"""
+def user_code_gen():
+    {transformed_code.replace('\\n', '\\n    ')}
+"""
+                # Compile and exec the code
+                exec(wrapped_code, self.exec_env)
+
+                # Create generator
+                self.gen = self.exec_env['user_code_gen']()
+
+                # Run until input or end
+                await self._run_generator()
+
             except Exception as e:
-                logger.error(f"Error closing exec socket: {str(e)}")
-            self.exec_socket = None
-        if self.container:
+                await self.send(text_data=json.dumps({'error': f'Error: {str(e)}'}))
+
+        elif 'input' in data and self.waiting_for_input:
             try:
-                self.container.stop(timeout=1)
-                self.container.remove()
-                logger.info("Container cleaned up")
+                user_input = data['input']
+                # Send input back into the generator
+                output = self.gen.send(user_input)
+                await self._handle_generator_output(output)
+            except StopIteration:
+                self.gen = None
+                self.waiting_for_input = False
+                await self.send(text_data=json.dumps({'output': 'Execution finished'}))
             except Exception as e:
-                logger.error(f"Error cleaning up container: {str(e)}")
-            self.container = None
-        self.exec_id = None
-        self.is_running = False
-        self.current_code = None
-        self.input_count = 0
-        self.input_processed = 0
+                await self.send(text_data=json.dumps({'error': f'Error: {str(e)}'}))
+
+        else:
+            await self.send(text_data=json.dumps({'error': 'Send code first or input when requested.'}))
+
+    async def _run_generator(self):
+        self.waiting_for_input = False
+        try:
+            output = next(self.gen)
+            await self._handle_generator_output(output)
+        except StopIteration:
+            self.gen = None
+            await self.send(text_data=json.dumps({'output': 'Execution finished'}))
+
+    async def _handle_generator_output(self, output):
+        if isinstance(output, str):
+            # output as input prompt
+            self.waiting_for_input = True
+            await self.send(text_data=json.dumps({'input_requested': True, 'prompt': output}))
+        elif output is None:
+            # Just continue running
+            await self._run_generator()
+        else:
+            # Any other output? Send it
+            await self.send(text_data=json.dumps({'output': str(output)}))
+
+    def _print(self, *args, **kwargs):
+        # Capture print output in output_buffer
+        print(*args, **kwargs, file=self.output_buffer)
+        self._printed_output = self.output_buffer.getvalue()
+
+    def _input_replacement(self, prompt=''):
+        # This function will be called inside generator with yield
+        # Yield prompt, wait for input to be sent in
+        user_input = yield prompt
+        return user_input
+
+    def _transform_input_calls(self, code_str):
+        # Very basic replacement of input() calls with yield from input_replacement()
+        # WARNING: This is a simple replace and not safe for all cases (e.g., inside strings).
+        # For production, use a proper parser (like ast) to rewrite calls.
+        return code_str.replace('input(', 'yield from input_replacement(')
