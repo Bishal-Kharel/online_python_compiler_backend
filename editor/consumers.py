@@ -17,6 +17,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.expecting_input = False
         self.input_count = 0
         self.processed_inputs = 0
+        self.temp_file_path = None
         await self.accept()
         logger.info("WebSocket connected")
 
@@ -60,10 +61,10 @@ class CodeConsumer(AsyncWebsocketConsumer):
             with tempfile.NamedTemporaryFile(suffix='.py', dir='/tmp', delete=False) as temp_file:
                 temp_file.write(code.encode())
                 temp_file.flush()
-                temp_file_path = temp_file.name
-                logger.info(f"Starting subprocess for file: {temp_file_path}")
+                self.temp_file_path = temp_file.name
+                logger.info(f"Starting subprocess for file: {self.temp_file_path}")
                 self.process = await asyncio.create_subprocess_exec(
-                    'stdbuf', '-oL', 'python3', '-u', temp_file_path,
+                    'stdbuf', '-oL', 'python3', '-u', self.temp_file_path,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.PIPE,
@@ -76,12 +77,6 @@ class CodeConsumer(AsyncWebsocketConsumer):
             logger.error(f"Execution error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
             await self.cleanup_process()
-        finally:
-            if temp_file_path and os.path.exists(temp_file_path):
-                try:
-                    os.unlink(temp_file_path)
-                except Exception as e:
-                    logger.error(f"Failed to delete temp file {temp_file_path}: {str(e)}")
 
     async def stream_output(self):
         try:
@@ -161,6 +156,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.expecting_input = False
         self.input_count = 0
         self.processed_inputs = 0
+        if self.temp_file_path and os.path.exists(self.temp_file_path):
+            try:
+                os.unlink(self.temp_file_path)
+                logger.info(f"Deleted temp file: {self.temp_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to delete temp file {self.temp_file_path}: {str(e)}")
+        self.temp_file_path = None
         while not self.input_queue.empty():
             try:
                 self.input_queue.get_nowait()
