@@ -1,8 +1,10 @@
 import json
 import asyncio
-import subprocess
-import tempfile
+import pty
 import os
+import tempfile
+import subprocess
+import select
 from channels.generic.websocket import AsyncWebsocketConsumer
 import logging
 
@@ -18,6 +20,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.input_count = 0
         self.processed_inputs = 0
         self.temp_file_path = None
+        self.pty_fd = None
         await self.accept()
         logger.info("WebSocket connected")
 
@@ -41,7 +44,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 await self.cleanup_process()
                 await self.execute_code(data['code'])
             elif 'input' in data:
-                if self.is_running and self.process and self.process.returncode is None:
+                if self.is_running and self.pty_fd is not None:
                     await self.input_queue.put(data['input'] + '\n')
                     logger.info(f"Queued input: {data['input']}")
                 else:
@@ -61,30 +64,34 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.expecting_input = 'input(' in code.lower()
         self.input_count = code.lower().count('input(')
         self.processed_inputs = 0
-        temp_dir = '/tmp'  # Default to /tmp for Render
+        temp_dir = '/tmp'
         try:
-            # Try creating temp file in /tmp
             with tempfile.NamedTemporaryFile(suffix='.py', dir=temp_dir, delete=False) as temp_file:
                 temp_file.write(code.encode('utf-8'))
                 temp_file.flush()
                 self.temp_file_path = temp_file.name
-                logger.info(f"Starting subprocess for file: {self.temp_file_path}")
+                logger.info(f"Starting PTY subprocess for file: {self.temp_file_path}")
+                self.pty_fd, child_fd = pty.openpty()
                 self.process = await asyncio.create_subprocess_exec(
-                    'stdbuf', '-oL', 'python3', '-u', self.temp_file_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.PIPE,
-                    env={'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'utf-8'}
+                    'python3', '-u', self.temp_file_path,
+                    stdin=child_fd,
+                    stdout=child_fd,
+                    stderr=child_fd,
+                    env={'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'utf-8'},
+                    close_fds=True
                 )
+                os.close(child_fd)
             self.is_running = True
             asyncio.create_task(self.stream_output())
             asyncio.create_task(self.process_input())
+            # Watchdog to detect stalls
+            asyncio.create_task(self.watchdog())
         except PermissionError as e:
             logger.error(f"Permission error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
             await self.cleanup_process()
         except Exception as e:
-            logger.error(f"Execution error: {str(e)}")
+            logger.error(f"PTY execution error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Execution failed: {str(e)}'}))
             await self.cleanup_process()
 
@@ -92,37 +99,24 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 try:
-                    timeout = 120 if self.expecting_input else 30
-                    stdout = await asyncio.wait_for(self.process.stdout.readline(), timeout=timeout)
-                    if stdout:
-                        output = stdout.decode('utf-8').strip()
+                    rlist, _, _ = select.select([self.pty_fd], [], [], 30)
+                    if self.pty_fd in rlist:
+                        output = os.read(self.pty_fd, 1024).decode('utf-8', errors='replace').strip()
                         if output:
                             formatted_output = output
                             if self.expecting_input and self.processed_inputs < self.input_count:
                                 formatted_output = output + ' >>>'
                             logger.info(f"Sending output: {formatted_output}")
                             await self.send(text_data=json.dumps({'output': formatted_output + '\n'}))
-                    
-                    try:
-                        stderr = await asyncio.wait_for(self.process.stderr.readline(), timeout=0.1)
-                        if stderr:
-                            error = stderr.decode('utf-8').strip()
-                            if error:
-                                logger.info(f"Sending error: {error}")
-                                await self.send(text_data=json.dumps({'error': error + '\n'}))
-                                self.expecting_input = False
-                    except asyncio.TimeoutError:
-                        pass
-                except asyncio.TimeoutError:
-                    logger.warning("Stream timeout, terminating process")
-                    await self.send(text_data=json.dumps({'error': 'Process timed out waiting for output or input'}))
+                    else:
+                        logger.warning("No output received, continuing to wait")
+                except Exception as e:
+                    logger.error(f"Stream error: {str(e)}")
+                    await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
                     break
             if self.process and self.process.returncode is not None:
                 logger.info(f"Process exited with returncode: {self.process.returncode}")
                 await self.send(text_data=json.dumps({'output': f'\nProcess exited with code {self.process.returncode}\n'}))
-        except Exception as e:
-            logger.error(f"Stream error: {str(e)}")
-            await self.send(text_data=json.dumps({'error': f'Stream error: {str(e)}'}))
         finally:
             await self.cleanup_process()
 
@@ -130,9 +124,8 @@ class CodeConsumer(AsyncWebsocketConsumer):
         try:
             while self.is_running and self.process and self.process.returncode is None:
                 input_data = await self.input_queue.get()
-                if self.process and self.process.stdin and self.process.returncode is None:
-                    self.process.stdin.write(input_data.encode('utf-8'))
-                    await self.process.stdin.drain()
+                if self.pty_fd is not None:
+                    os.write(self.pty_fd, input_data.encode('utf-8'))
                     logger.info(f"Sent input: {input_data.strip()}")
                     self.processed_inputs += 1
                     self.expecting_input = self.processed_inputs < self.input_count
@@ -143,6 +136,13 @@ class CodeConsumer(AsyncWebsocketConsumer):
             logger.error(f"Input error: {str(e)}")
             await self.send(text_data=json.dumps({'error': f'Input error: {str(e)}'}))
         finally:
+            await self.cleanup_process()
+
+    async def watchdog(self):
+        await asyncio.sleep(60)  # Wait 60 seconds
+        if self.is_running and self.process and self.process.returncode is None and self.processed_inputs == 0:
+            logger.warning("Watchdog: Process stalled, terminating")
+            await self.send(text_data=json.dumps({'error': 'Process stalled, terminated'}))
             await self.cleanup_process()
 
     async def cleanup_process(self):
@@ -158,23 +158,9 @@ class CodeConsumer(AsyncWebsocketConsumer):
                     await self.process.wait()
             except Exception as e:
                 logger.error(f"Cleanup error: {str(e)}")
-        self.process = None
-        self.is_running = False
-        self.current_code = None
-        self.expecting_input = False
-        self.input_count = 0
-        self.processed_inputs = 0
-        if self.temp_file_path and os.path.exists(self.temp_file_path):
+        if self.pty_fd is not None:
             try:
-                os.unlink(self.temp_file_path)
-                logger.info(f"Deleted temp file: {self.temp_file_path}")
+                os.close(self.pty_fd)
+                logger.info("Closed PTY FD")
             except Exception as e:
-                logger.error(f"Failed to delete temp file {self.temp_file_path}: {str(e)}")
-        self.temp_file_path = None
-        while not self.input_queue.empty():
-            try:
-                self.input_queue.get_nowait()
-                self.input_queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-        logger.info("Cleanup completed")
+                logger.error(f"Failed
